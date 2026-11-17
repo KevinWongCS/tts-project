@@ -120,10 +120,10 @@ DEFAULT_SPEED = 1.0
 MAX_CHUNK_CHARS = 300        # sentences longer than this are split further
 PREFETCH_CHUNKS = 3          # how many synthesized sentences may wait for playback
 SYNTH_CONCURRENCY = 3        # sentences generated in parallel (still played in order)
-FIRST_CHUNK_CHARS = 90       # the first chunk is kept short so speech starts sooner
+FIRST_CHUNK_CHARS = 50       # the first chunk is kept short so speech starts sooner
 MIN_HEAD_CHARS = 25          # ...but never split off a head shorter than this
-COPY_DELAY_S = 0.10          # time given to the OS to register the simulated copy
-EXTRA_COPY_POLLS = 4         # extra 50 ms polls if the clipboard is not ready yet
+COPY_POLL_S = 0.015          # how often to check whether the simulated copy has landed
+COPY_TIMEOUT_S = 0.40        # give up waiting for the clipboard after this long
 SYNTH_TIMEOUT_S = 30         # per-sentence network timeout
 SYNTH_ATTEMPTS = 2           # tries per sentence before giving up on it
 MODIFIER_RELEASE_TIMEOUT_S = 1.0
@@ -669,13 +669,13 @@ class ClipboardCapture:
                 pyperclip.copy(sentinel)
                 self._wait_for_alt_release()
                 self._send_copy()
-                time.sleep(COPY_DELAY_S)
-                text = pyperclip.paste()
-                for _ in range(EXTRA_COPY_POLLS):
-                    if text and text != sentinel:
-                        break
-                    time.sleep(0.05)
+                # Poll instead of sleeping a fixed time: continue the moment the copy lands.
+                deadline = time.monotonic() + COPY_TIMEOUT_S
+                while True:
+                    time.sleep(COPY_POLL_S)
                     text = pyperclip.paste()
+                    if (text and text != sentinel) or time.monotonic() >= deadline:
+                        break
             except Exception:
                 log.exception("Clipboard capture failed")
             finally:
@@ -1000,11 +1000,27 @@ class ReaderApp:
         self.engine.stop()
         threading.Thread(target=self.read_selection, name="tts-capture", daemon=True).start()
 
+    def _warm_up(self) -> None:
+        """Make one throwaway request at startup so the first real read isn't slower (DNS, TLS, clock sync)."""
+        async def go() -> None:
+            communicate = edge_tts.Communicate("Ready", self.settings.voice, rate=self.settings.rate)
+            async for _ in communicate.stream():
+                pass
+
+        try:
+            t0 = time.monotonic()
+            asyncio.run(asyncio.wait_for(go(), timeout=SYNTH_TIMEOUT_S))
+            log.info("Speech service warmed up in %.2fs.", time.monotonic() - t0)
+        except Exception as exc:  # offline at startup is fine
+            log.debug("Warm-up skipped: %s", exc)
+
     def read_selection(self) -> None:
         if not self._capture_busy.acquire(blocking=False):
             return  # a capture is already in progress (double press)
         try:
+            t0 = time.monotonic()
             raw = self.capture.get_selection()
+            log.info("Selection captured in %.2fs.", time.monotonic() - t0)
             chunks = prepare_chunks(raw)
             if not chunks:
                 log.info("No readable text was selected.")
@@ -1076,6 +1092,7 @@ class ReaderApp:
         icon.visible = True
         # Start the hotkey listener only now, after the main-thread GUI loop exists.
         self.hotkeys.start()
+        threading.Thread(target=self._warm_up, name="tts-warmup", daemon=True).start()
         log.info("%s is running. Select text and press %s+A.", APP_NAME, "Option" if IS_MAC else "Alt")
 
     # -- lifecycle ---------------------------------------------------------
