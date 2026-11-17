@@ -97,8 +97,10 @@ Notes for macOS:
 
 Tray / menu-bar menu:
 
-* **Voice** – Andrew, Aria, Brian, Ava (US) · Sonia, Ryan (UK)
+* **Voice** – about 30 free Microsoft neural voices, grouped by accent: US, UK, Ireland, Australia, Canada, India,
+  South Africa, New Zealand (voices the service doesn't offer are hidden automatically)
 * **Speed** – 1.0x, 1.25x, 1.5x, 1.75x, 2.0x
+* **Pitch** – Very low, Low, Normal, High (a low pitch on a UK male voice makes a good "wizard narrator")
 * **Start at login** (Windows)
 * **Stop Speaking**
 * **Quit**

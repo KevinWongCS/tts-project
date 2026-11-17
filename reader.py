@@ -56,7 +56,7 @@ import uuid
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 # Hide pygame's "Hello from the pygame community" banner. Must be set before import.
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -105,14 +105,58 @@ CONFIG_PATH = DATA_DIR / "config.json"
 LEGACY_CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
 
 # voice id -> label shown in the tray menu (insertion order = menu order)
-VOICES: Dict[str, str] = {
-    "en-US-AndrewNeural": "Andrew (US, male)",
-    "en-US-AriaNeural": "Aria (US, female)",
-    "en-US-BrianNeural": "Brian (US, male)",
-    "en-US-AvaNeural": "Ava (US, female)",
-    "en-GB-SoniaNeural": "Sonia (UK, female)",
-    "en-GB-RyanNeural": "Ryan (UK, male)",
+# Voices shown in the tray menu, grouped by accent. At startup the app asks the
+# service which of these actually exist and hides any that don't.
+VOICE_GROUPS: Dict[str, Dict[str, str]] = {
+    "US": {
+        "en-US-AndrewNeural": "Andrew (US, male)",
+        "en-US-AriaNeural": "Aria (US, female)",
+        "en-US-BrianNeural": "Brian (US, male)",
+        "en-US-AvaNeural": "Ava (US, female)",
+        "en-US-ChristopherNeural": "Christopher (US, male)",
+        "en-US-GuyNeural": "Guy (US, male)",
+        "en-US-EricNeural": "Eric (US, male)",
+        "en-US-RogerNeural": "Roger (US, male)",
+        "en-US-SteffanNeural": "Steffan (US, male)",
+        "en-US-EmmaNeural": "Emma (US, female)",
+        "en-US-JennyNeural": "Jenny (US, female)",
+        "en-US-MichelleNeural": "Michelle (US, female)",
+    },
+    "UK": {
+        "en-GB-RyanNeural": "Ryan (UK, male)",
+        "en-GB-ThomasNeural": "Thomas (UK, male)",
+        "en-GB-SoniaNeural": "Sonia (UK, female)",
+        "en-GB-LibbyNeural": "Libby (UK, female)",
+    },
+    "Ireland": {
+        "en-IE-ConnorNeural": "Connor (Ireland, male)",
+        "en-IE-EmilyNeural": "Emily (Ireland, female)",
+    },
+    "Australia": {
+        "en-AU-WilliamNeural": "William (Australia, male)",
+        "en-AU-NatashaNeural": "Natasha (Australia, female)",
+    },
+    "Canada": {
+        "en-CA-LiamNeural": "Liam (Canada, male)",
+        "en-CA-ClaraNeural": "Clara (Canada, female)",
+    },
+    "India": {
+        "en-IN-PrabhatNeural": "Prabhat (India, male)",
+        "en-IN-NeerjaNeural": "Neerja (India, female)",
+    },
+    "South Africa": {
+        "en-ZA-LukeNeural": "Luke (South Africa, male)",
+        "en-ZA-LeahNeural": "Leah (South Africa, female)",
+    },
+    "New Zealand": {
+        "en-NZ-MitchellNeural": "Mitchell (New Zealand, male)",
+        "en-NZ-MollyNeural": "Molly (New Zealand, female)",
+    },
 }
+VOICES: Dict[str, str] = {vid: label for group in VOICE_GROUPS.values() for vid, label in group.items()}
+PITCHES = (-40, -20, 0, 20)  # Hz offsets understood by edge-tts
+PITCH_LABELS = {-40: "Very low", -20: "Low", 0: "Normal", 20: "High"}
+DEFAULT_PITCH = 0
 SPEEDS = (1.0, 1.25, 1.5, 1.75, 2.0)
 DEFAULT_VOICE = "en-US-AndrewNeural"
 DEFAULT_SPEED = 1.0
@@ -127,6 +171,9 @@ COPY_TIMEOUT_S = 0.40        # give up waiting for the clipboard after this long
 SYNTH_TIMEOUT_S = 30         # per-sentence network timeout
 SYNTH_ATTEMPTS = 2           # tries per sentence before giving up on it
 MODIFIER_RELEASE_TIMEOUT_S = 1.0
+TRIM_SILENCE = True          # cut the silent padding the service adds around every sentence
+SILENCE_THRESHOLD = 300      # 16-bit sample amplitude below which audio counts as silence
+KEEP_SILENCE_MS = 60         # silence kept at each end, so sentences still have a natural short gap
 
 # Hotkey key identification (virtual key codes differ per platform).
 # macOS: kVK_ANSI_A = 0, kVK_ANSI_S = 1 (physical key positions).
@@ -295,11 +342,41 @@ def prepare_chunks(raw: str) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Silence trimming
+# --------------------------------------------------------------------------- #
+
+def trim_silence(raw: bytes, channels: int, freq: int) -> bytes:
+    """
+    Remove near-silent audio from the start and end of 16-bit PCM `raw`, keeping
+    KEEP_SILENCE_MS at each end. Returns `raw` unchanged if it is all silence.
+    """
+    frame_bytes = 2 * channels
+    usable = len(raw) - len(raw) % frame_bytes
+    if usable <= 0:
+        return raw
+    samples = memoryview(raw)[:usable].cast("h")
+    total = len(samples)
+    first = 0
+    while first < total and abs(samples[first]) < SILENCE_THRESHOLD:
+        first += 1
+    if first == total:
+        return raw
+    last = total - 1
+    while last > first and abs(samples[last]) < SILENCE_THRESHOLD:
+        last -= 1
+    keep = int(freq * KEEP_SILENCE_MS / 1000) * channels
+    start = max(0, first - keep) // channels * channels
+    end = min(total, last + 1 + keep)
+    end = min(total, (end + channels - 1) // channels * channels)
+    return bytes(raw[start * 2:end * 2])
+
+
+# --------------------------------------------------------------------------- #
 # Persistent settings
 # --------------------------------------------------------------------------- #
 
 class Settings:
-    """Voice + speed, stored in config.json next to this script."""
+    """Voice + speed + pitch, stored in config.json next to this script."""
 
     def __init__(self, path: Path = CONFIG_PATH, legacy_path: Optional[Path] = None) -> None:
         self._path = path
@@ -307,6 +384,7 @@ class Settings:
         self._lock = threading.RLock()
         self._voice = DEFAULT_VOICE
         self._speed = DEFAULT_SPEED
+        self._pitch = DEFAULT_PITCH
         self._load()
 
     # -- persistence -------------------------------------------------------
@@ -333,9 +411,12 @@ class Settings:
         match = [s for s in SPEEDS if abs(s - speed) < 1e-6]
         if match:
             self._speed = match[0]
+        pitch = data.get("pitch", DEFAULT_PITCH)
+        if pitch in PITCHES:
+            self._pitch = pitch
 
     def _save(self) -> None:
-        payload = json.dumps({"voice": self._voice, "speed": self._speed}, indent=2)
+        payload = json.dumps({"voice": self._voice, "speed": self._speed, "pitch": self._pitch}, indent=2)
         tmp = self._path.with_name(self._path.name + ".tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,6 +441,24 @@ class Settings:
         """Speed as an edge-tts rate string: 1.0 -> '+0%', 1.25 -> '+25%'."""
         with self._lock:
             return f"{round((self._speed - 1.0) * 100):+d}%"
+
+    @property
+    def pitch(self) -> int:
+        with self._lock:
+            return self._pitch
+
+    @property
+    def pitch_str(self) -> str:
+        """Pitch as an edge-tts string: 0 -> '+0Hz', -20 -> '-20Hz'."""
+        with self._lock:
+            return f"{self._pitch:+d}Hz"
+
+    def set_pitch(self, pitch: int) -> None:
+        if pitch not in PITCHES:
+            return
+        with self._lock:
+            self._pitch = pitch
+            self._save()
 
     def set_voice(self, voice: str) -> None:
         if voice not in VOICES:
@@ -386,6 +485,7 @@ class _Job:
     chunks: List[str]
     voice: str
     rate: str
+    pitch: str = "+0Hz"
 
 
 class SpeechEngine:
@@ -415,14 +515,14 @@ class SpeechEngine:
         self._player.start()
 
     # -- public API --------------------------------------------------------
-    def speak(self, chunks: List[str], voice: str, rate: str) -> None:
+    def speak(self, chunks: List[str], voice: str, rate: str, pitch: str = "+0Hz") -> None:
         """Interrupt anything currently speaking and read `chunks` instead."""
         if not chunks or self._shutdown.is_set():
             return
         with self._gen_lock:
             self._generation += 1
             generation = self._generation
-        self._jobs.put(_Job(generation, list(chunks), voice, rate))
+        self._jobs.put(_Job(generation, list(chunks), voice, rate, pitch))
 
     def stop(self) -> None:
         """Stop playback immediately and discard everything still queued."""
@@ -464,9 +564,9 @@ class SpeechEngine:
                 time.sleep(0.05)
         log.debug("Could not delete temporary file %s", path)
 
-    async def _synthesize(self, text: str, voice: str, rate: str, path: str) -> None:
+    async def _synthesize(self, text: str, voice: str, rate: str, pitch: str, path: str) -> None:
         """Generate `text` into an mp3 file at `path` (runs on the producer's asyncio loop)."""
-        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
         await asyncio.wait_for(communicate.save(path), timeout=SYNTH_TIMEOUT_S)
 
     async def _synthesize_one(self, chunk: str, job: _Job, path: str) -> bool:
@@ -475,7 +575,7 @@ class SpeechEngine:
             if not self._is_current(job.generation):
                 return False
             try:
-                await self._synthesize(chunk, job.voice, job.rate, path)
+                await self._synthesize(chunk, job.voice, job.rate, job.pitch, path)
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     return True
                 log.warning("edge-tts produced no audio (attempt %d).", attempt)
@@ -580,33 +680,65 @@ class SpeechEngine:
         finally:
             loop.close()
 
-    def _player_loop(self) -> None:
-        while not self._shutdown.is_set():
-            try:
-                generation, path = self._audio.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if not self._is_current(generation):
-                self._remove(path)  # stale: belongs to interrupted speech
-                continue
-            self._play_file(generation, path)
-
-    def _play_file(self, generation: int, path: str) -> None:
-        music = pygame.mixer.music
+    def _load_sound(self, path: str) -> Optional["pygame.mixer.Sound"]:
+        """Decode a finished .mp3 into memory (trimming silent padding) and delete the file."""
         try:
-            music.load(path)
-            music.play()
-            while music.get_busy() and self._is_current(generation):
-                time.sleep(0.02)
+            sound = pygame.mixer.Sound(path)
+            init = pygame.mixer.get_init()
+            if TRIM_SILENCE and init and init[1] == -16:  # 16-bit signed output only
+                freq, _fmt, channels = init
+                raw = sound.get_raw()
+                trimmed = trim_silence(raw, channels, freq)
+                if len(trimmed) < len(raw):
+                    sound = pygame.mixer.Sound(buffer=trimmed)
+            return sound
         except pygame.error as exc:
             log.warning("Playback error: %s", exc)
+            return None
         finally:
-            try:
-                music.stop()
-                music.unload()  # release the file handle so it can be deleted (Windows)
-            except pygame.error:
-                pass
+            self._remove(path)  # fully decoded in memory, so the file can go right away
+
+    def _prepare_next(self) -> Optional[tuple]:
+        """If the next sentence is already synthesized, decode it now (while the current one plays)."""
+        try:
+            generation, path = self._audio.get_nowait()
+        except queue.Empty:
+            return None
+        if not self._is_current(generation):
             self._remove(path)
+            return None
+        sound = self._load_sound(path)
+        return (generation, sound) if sound is not None else None
+
+    def _player_loop(self) -> None:
+        prepared: Optional[tuple] = None
+        while not self._shutdown.is_set():
+            if prepared is not None:
+                generation, sound = prepared
+                prepared = None
+                if not self._is_current(generation):
+                    continue  # belongs to interrupted speech
+            else:
+                try:
+                    generation, path = self._audio.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if not self._is_current(generation):
+                    self._remove(path)  # stale: belongs to interrupted speech
+                    continue
+                sound = self._load_sound(path)
+                if sound is None:
+                    continue
+            channel = sound.play()
+            if channel is None:
+                continue
+            try:
+                while channel.get_busy() and self._is_current(generation):
+                    if prepared is None:
+                        prepared = self._prepare_next()  # get the next sentence ready for a tight handover
+                    time.sleep(0.005)
+            finally:
+                channel.stop()  # no-op after a natural end; cuts the audio when interrupted
 
 
 # --------------------------------------------------------------------------- #
@@ -987,6 +1119,7 @@ class ReaderApp:
         self.icon: Optional[pystray.Icon] = None
         self.engine = SpeechEngine(notify=self._notify)
         self.capture = ClipboardCapture()
+        self._available_voices: Optional[Set[str]] = None  # filled in by the startup warm-up
         self.hotkeys = HotkeyManager(on_speak=self._on_speak_hotkey, on_stop=self.engine.stop)
         self._capture_busy = threading.Lock()
         self._quitting = threading.Event()
@@ -1003,6 +1136,12 @@ class ReaderApp:
     def _warm_up(self) -> None:
         """Make one throwaway request at startup so the first real read isn't slower (DNS, TLS, clock sync)."""
         async def go() -> None:
+            available = {v["ShortName"] for v in await edge_tts.list_voices()}
+            if available:
+                self._available_voices = available
+                if self.settings.voice not in available:
+                    self.settings.set_voice(DEFAULT_VOICE)
+                self._refresh_tray()
             communicate = edge_tts.Communicate("Ready", self.settings.voice, rate=self.settings.rate)
             async for _ in communicate.stream():
                 pass
@@ -1027,7 +1166,7 @@ class ReaderApp:
                 return
             log.info("Reading %d chunk(s).", len(chunks))
             # speak() interrupts whatever is playing, so a new Alt+A cleanly replaces old speech.
-            self.engine.speak(chunks, self.settings.voice, self.settings.rate)
+            self.engine.speak(chunks, self.settings.voice, self.settings.rate, self.settings.pitch_str)
         except Exception:
             log.exception("read_selection failed")
         finally:
@@ -1051,12 +1190,31 @@ class ReaderApp:
             self.icon.title = self._title()
             self.icon.update_menu()
 
+    def _voice_available(self, voice: str) -> bool:
+        return self._available_voices is None or voice in self._available_voices
+
     def _voice_item(self, voice: str, label: str) -> pystray.MenuItem:
         def choose(icon, item) -> None:
             self.settings.set_voice(voice)
             self._refresh_tray()
 
-        return pystray.MenuItem(label, choose, checked=lambda item: self.settings.voice == voice, radio=True)
+        return pystray.MenuItem(
+            label, choose, checked=lambda item: self.settings.voice == voice, radio=True,
+            visible=lambda item: self._voice_available(voice),
+        )
+
+    def _voice_group_item(self, group: str, voices: Dict[str, str]) -> pystray.MenuItem:
+        submenu = pystray.Menu(*[self._voice_item(v, l) for v, l in voices.items()])
+        return pystray.MenuItem(
+            group, submenu, visible=lambda item: any(self._voice_available(v) for v in voices),
+        )
+
+    def _pitch_item(self, pitch: int) -> pystray.MenuItem:
+        def choose(icon, item) -> None:
+            self.settings.set_pitch(pitch)
+            self._refresh_tray()
+
+        return pystray.MenuItem(PITCH_LABELS[pitch], choose, checked=lambda item: self.settings.pitch == pitch, radio=True)
 
     def _speed_item(self, speed: float) -> pystray.MenuItem:
         def choose(icon, item) -> None:
@@ -1070,8 +1228,9 @@ class ReaderApp:
         items = [
             pystray.MenuItem(f"{hint}+A: read selection   {hint}+S: stop", lambda icon, item: None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Voice", pystray.Menu(*[self._voice_item(v, l) for v, l in VOICES.items()])),
+            pystray.MenuItem("Voice", pystray.Menu(*[self._voice_group_item(g, v) for g, v in VOICE_GROUPS.items()])),
             pystray.MenuItem("Speed", pystray.Menu(*[self._speed_item(s) for s in SPEEDS])),
+            pystray.MenuItem("Pitch", pystray.Menu(*[self._pitch_item(p) for p in PITCHES])),
         ]
         if IS_WINDOWS:
             items.append(pystray.MenuItem("Start at login", self._toggle_autostart, checked=lambda item: autostart_enabled()))
