@@ -758,30 +758,31 @@ class HotkeyManager:
     # by moving focus (e.g. into the message box), which drops the text selection
     # before the simulated Ctrl+C runs, so nothing gets copied.
     def _win32_filter(self, msg, data):
+        swallow = False
         try:
-            if data.flags & 0x10:  # LLKHF_INJECTED: our own / other synthetic keys
-                return True
-            action = VK_ACTIONS.get(data.vkCode)
-            if action is None:
-                return True
-            if msg in (0x100, 0x104):  # WM_KEYDOWN / WM_SYSKEYDOWN
-                if not data.flags & 0x20:  # LLKHF_ALTDOWN: Alt is not held
-                    return True
-                if action not in self._win_swallowed:
-                    self._win_swallowed.add(action)
-                    # Alt pressed+released with nothing in between would activate the
-                    # app's menu bar; send a dummy key so Windows treats it as a chord.
-                    threading.Thread(target=self._win_mask_alt, daemon=True).start()
-                    self._dispatch(action)
-                self._listener.suppress_event()
-            elif msg in (0x101, 0x105):  # WM_KEYUP / WM_SYSKEYUP
-                if action in self._win_swallowed:
-                    self._win_swallowed.discard(action)
-                    self._listener.suppress_event()
-        except self._listener.SuppressException:
-            raise
+            if not data.flags & 0x10:  # skip LLKHF_INJECTED: our own / other synthetic keys
+                action = VK_ACTIONS.get(data.vkCode)
+                if action is not None:
+                    if msg in (0x100, 0x104):  # WM_KEYDOWN / WM_SYSKEYDOWN
+                        if data.flags & 0x20:  # LLKHF_ALTDOWN: Alt is held
+                            swallow = True
+                            if action not in self._win_swallowed:
+                                self._win_swallowed.add(action)
+                                # Alt pressed+released with nothing in between would activate
+                                # the app's menu bar; send a dummy key so Windows treats it
+                                # as a chord.
+                                threading.Thread(target=self._win_mask_alt, daemon=True).start()
+                                self._dispatch(action)
+                    elif msg in (0x101, 0x105):  # WM_KEYUP / WM_SYSKEYUP
+                        if action in self._win_swallowed:
+                            self._win_swallowed.discard(action)
+                            swallow = True
         except Exception:
             log.debug("win32 filter failed", exc_info=True)
+        # suppress_event() works by raising an exception that pynput handles, so it
+        # must be called outside the try/except above.
+        if swallow:
+            self._listener.suppress_event()
         return True
 
     def _win_mask_alt(self) -> None:
@@ -992,6 +993,9 @@ class ReaderApp:
     def _on_speak_hotkey(self) -> None:
         # Never block the hotkey thread: simulating keystrokes from inside a
         # keyboard hook can deadlock, so do the work on a short-lived thread.
+        # Cut off whatever is playing right away so a repeat press feels instant;
+        # the newly highlighted text is captured and read right after.
+        self.engine.stop()
         threading.Thread(target=self.read_selection, name="tts-capture", daemon=True).start()
 
     def read_selection(self) -> None:
