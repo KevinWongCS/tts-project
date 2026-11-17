@@ -32,7 +32,10 @@ build it yourself.
 Settings and the log file live in `%APPDATA%\TTSReader\` (`config.json`, `reader.log`). The log records errors and
 counts, never the text you read.
 
-macOS: there is no packaged download yet. Run from source (below).
+> **macOS status:** macOS support is currently **run-from-source only** and has not been tested as thoroughly as
+> Windows. There is no packaged Mac app yet: an unsigned app would be blocked by macOS Gatekeeper, and a signed one
+> needs an Apple Developer account. "Start at login" is also Windows-only for now. A packaged Mac app may come later.
+> See [Run from source](#run-from-source) below.
 
 ## Run from source
 
