@@ -537,6 +537,8 @@ class SpeechEngine:
                 pending.popleft()
                 if not ok:
                     self._remove(path)
+                    if not self._is_current(job.generation):
+                        return  # interrupted by a new read or Stop: not a network failure
                     failures += 1
                     if failures == 1:
                         self._notify("Could not generate speech. Check your internet connection.")
