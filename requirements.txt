@@ -1,0 +1,13 @@
+# Text-to-Speech Reader - Python 3.10 - 3.13 recommended
+#
+# Install with:  pip install -r requirements.txt
+#
+# On macOS, pynput and pystray automatically pull in the required PyObjC
+# frameworks (Quartz / ApplicationServices / Cocoa), so nothing extra is listed.
+
+edge-tts>=7.0.0,<8      # Microsoft Edge neural voices (needs internet). Upgrade if voices stop working.
+pygame>=2.6.1,<3        # audio playback (pygame.mixer)
+pynput>=1.7.7,<2        # global hotkeys + simulated Ctrl/Cmd+C (1.7.7+ needed for macOS key interception)
+pyperclip>=1.8.2,<2     # clipboard save / restore
+pystray>=0.19.5,<0.20   # system tray / menu bar icon
+Pillow>=10.0.0          # draws the tray icon in code

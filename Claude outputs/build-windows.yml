@@ -1,0 +1,88 @@
+name: Build Windows release
+
+# Push a version tag (for example:  git tag v1.0.0  &&  git push origin v1.0.0)
+# and this workflow builds the app and publishes a GitHub Release with:
+#   - TTSReader-Setup-<version>.exe        (installer)
+#   - TTSReader-portable-<version>.zip     (unzip and run, no install)
+# You can also run it by hand from the "Actions" tab to test a build
+# (the files appear as a downloadable "artifact" on that run).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Work out the version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "0.0.0-dev"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Stamp the version into the app so the tray menu shows the right number.
+          $code = Get-Content reader.py -Raw
+          $code = $code -replace '__version__ = "[^"]*"', "__version__ = `"$version`""
+          Set-Content reader.py -Value $code -NoNewline -Encoding utf8
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pyinstaller>=6.10"
+
+      - name: Create the app icon
+        run: python -c "import reader; reader.make_icon_image(256).save('app.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(256,256)])"
+
+      - name: Build the app (PyInstaller)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed
+          --name TTSReader --icon app.ico
+          --collect-submodules pynput
+          --hidden-import pystray._win32
+          reader.py
+
+      - name: Check the build output
+        run: |
+          if (-not (Test-Path "dist\TTSReader\TTSReader.exe")) { throw "TTSReader.exe was not produced" }
+          Get-ChildItem dist\TTSReader | Select-Object -First 10
+
+      - name: Make the portable zip
+        run: Compress-Archive -Path "dist\TTSReader\*" -DestinationPath "dist\TTSReader-portable-$env:APP_VERSION.zip"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:APP_VERSION" installer.iss'
+
+      - name: Keep the files from this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: TTSReader-windows-${{ env.APP_VERSION }}
+          path: |
+            dist/TTSReader-Setup-*.exe
+            dist/TTSReader-portable-*.zip
+
+      - name: Publish the GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/TTSReader-Setup-*.exe
+            dist/TTSReader-portable-*.zip
+          generate_release_notes: true
