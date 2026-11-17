@@ -120,10 +120,10 @@ DEFAULT_SPEED = 1.0
 MAX_CHUNK_CHARS = 300        # sentences longer than this are split further
 PREFETCH_CHUNKS = 3          # how many synthesized sentences may wait for playback
 SYNTH_CONCURRENCY = 3        # sentences generated in parallel (still played in order)
-FIRST_CHUNK_CHARS = 90       # the first chunk is kept short so speech starts sooner
+FIRST_CHUNK_CHARS = 50       # the first chunk is kept short so speech starts sooner
 MIN_HEAD_CHARS = 25          # ...but never split off a head shorter than this
-COPY_DELAY_S = 0.10          # time given to the OS to register the simulated copy
-EXTRA_COPY_POLLS = 4         # extra 50 ms polls if the clipboard is not ready yet
+COPY_POLL_S = 0.015          # how often to check whether the simulated copy has landed
+COPY_TIMEOUT_S = 0.40        # give up waiting for the clipboard after this long
 SYNTH_TIMEOUT_S = 30         # per-sentence network timeout
 SYNTH_ATTEMPTS = 2           # tries per sentence before giving up on it
 MODIFIER_RELEASE_TIMEOUT_S = 1.0
@@ -537,6 +537,8 @@ class SpeechEngine:
                 pending.popleft()
                 if not ok:
                     self._remove(path)
+                    if not self._is_current(job.generation):
+                        return  # interrupted by a new read or Stop: not a network failure
                     failures += 1
                     if failures == 1:
                         self._notify("Could not generate speech. Check your internet connection.")
@@ -667,13 +669,13 @@ class ClipboardCapture:
                 pyperclip.copy(sentinel)
                 self._wait_for_alt_release()
                 self._send_copy()
-                time.sleep(COPY_DELAY_S)
-                text = pyperclip.paste()
-                for _ in range(EXTRA_COPY_POLLS):
-                    if text and text != sentinel:
-                        break
-                    time.sleep(0.05)
+                # Poll instead of sleeping a fixed time: continue the moment the copy lands.
+                deadline = time.monotonic() + COPY_TIMEOUT_S
+                while True:
+                    time.sleep(COPY_POLL_S)
                     text = pyperclip.paste()
+                    if (text and text != sentinel) or time.monotonic() >= deadline:
+                        break
             except Exception:
                 log.exception("Clipboard capture failed")
             finally:
@@ -758,30 +760,31 @@ class HotkeyManager:
     # by moving focus (e.g. into the message box), which drops the text selection
     # before the simulated Ctrl+C runs, so nothing gets copied.
     def _win32_filter(self, msg, data):
+        swallow = False
         try:
-            if data.flags & 0x10:  # LLKHF_INJECTED: our own / other synthetic keys
-                return True
-            action = VK_ACTIONS.get(data.vkCode)
-            if action is None:
-                return True
-            if msg in (0x100, 0x104):  # WM_KEYDOWN / WM_SYSKEYDOWN
-                if not data.flags & 0x20:  # LLKHF_ALTDOWN: Alt is not held
-                    return True
-                if action not in self._win_swallowed:
-                    self._win_swallowed.add(action)
-                    # Alt pressed+released with nothing in between would activate the
-                    # app's menu bar; send a dummy key so Windows treats it as a chord.
-                    threading.Thread(target=self._win_mask_alt, daemon=True).start()
-                    self._dispatch(action)
-                self._listener.suppress_event()
-            elif msg in (0x101, 0x105):  # WM_KEYUP / WM_SYSKEYUP
-                if action in self._win_swallowed:
-                    self._win_swallowed.discard(action)
-                    self._listener.suppress_event()
-        except self._listener.SuppressException:
-            raise
+            if not data.flags & 0x10:  # skip LLKHF_INJECTED: our own / other synthetic keys
+                action = VK_ACTIONS.get(data.vkCode)
+                if action is not None:
+                    if msg in (0x100, 0x104):  # WM_KEYDOWN / WM_SYSKEYDOWN
+                        if data.flags & 0x20:  # LLKHF_ALTDOWN: Alt is held
+                            swallow = True
+                            if action not in self._win_swallowed:
+                                self._win_swallowed.add(action)
+                                # Alt pressed+released with nothing in between would activate
+                                # the app's menu bar; send a dummy key so Windows treats it
+                                # as a chord.
+                                threading.Thread(target=self._win_mask_alt, daemon=True).start()
+                                self._dispatch(action)
+                    elif msg in (0x101, 0x105):  # WM_KEYUP / WM_SYSKEYUP
+                        if action in self._win_swallowed:
+                            self._win_swallowed.discard(action)
+                            swallow = True
         except Exception:
             log.debug("win32 filter failed", exc_info=True)
+        # suppress_event() works by raising an exception that pynput handles, so it
+        # must be called outside the try/except above.
+        if swallow:
+            self._listener.suppress_event()
         return True
 
     def _win_mask_alt(self) -> None:
@@ -992,13 +995,32 @@ class ReaderApp:
     def _on_speak_hotkey(self) -> None:
         # Never block the hotkey thread: simulating keystrokes from inside a
         # keyboard hook can deadlock, so do the work on a short-lived thread.
+        # Cut off whatever is playing right away so a repeat press feels instant;
+        # the newly highlighted text is captured and read right after.
+        self.engine.stop()
         threading.Thread(target=self.read_selection, name="tts-capture", daemon=True).start()
+
+    def _warm_up(self) -> None:
+        """Make one throwaway request at startup so the first real read isn't slower (DNS, TLS, clock sync)."""
+        async def go() -> None:
+            communicate = edge_tts.Communicate("Ready", self.settings.voice, rate=self.settings.rate)
+            async for _ in communicate.stream():
+                pass
+
+        try:
+            t0 = time.monotonic()
+            asyncio.run(asyncio.wait_for(go(), timeout=SYNTH_TIMEOUT_S))
+            log.info("Speech service warmed up in %.2fs.", time.monotonic() - t0)
+        except Exception as exc:  # offline at startup is fine
+            log.debug("Warm-up skipped: %s", exc)
 
     def read_selection(self) -> None:
         if not self._capture_busy.acquire(blocking=False):
             return  # a capture is already in progress (double press)
         try:
+            t0 = time.monotonic()
             raw = self.capture.get_selection()
+            log.info("Selection captured in %.2fs.", time.monotonic() - t0)
             chunks = prepare_chunks(raw)
             if not chunks:
                 log.info("No readable text was selected.")
@@ -1070,6 +1092,7 @@ class ReaderApp:
         icon.visible = True
         # Start the hotkey listener only now, after the main-thread GUI loop exists.
         self.hotkeys.start()
+        threading.Thread(target=self._warm_up, name="tts-warmup", daemon=True).start()
         log.info("%s is running. Select text and press %s+A.", APP_NAME, "Option" if IS_MAC else "Alt")
 
     # -- lifecycle ---------------------------------------------------------
