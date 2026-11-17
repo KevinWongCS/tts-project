@@ -41,8 +41,8 @@ Requirements: Python **3.10 – 3.13** (64-bit), working audio output.
 ### Windows
 
 ```powershell
-git clone <your-repo-url>
-cd <your-repo-folder>
+git clone https://github.com/KevinWongCS/tts-project
+cd tts-project
 
 python -m venv .venv
 .venv\Scripts\activate
@@ -56,8 +56,8 @@ Run it without a console window with `pythonw reader.py`.
 ### macOS
 
 ```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
+git clone https://github.com/KevinWongCS/tts-project
+cd tts-project
 
 python3 -m venv .venv
 source .venv/bin/activate
