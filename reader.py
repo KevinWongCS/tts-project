@@ -704,12 +704,15 @@ class HotkeyManager:
     def __init__(self, on_speak: Callable[[], None], on_stop: Callable[[], None]) -> None:
         self._callbacks = {"speak": on_speak, "stop": on_stop}
         self._held: Dict[str, float] = {}
+        self._win_swallowed: set = set()
         self._listener: Optional[keyboard.Listener] = None
 
     def start(self) -> None:
         kwargs = {}
         if IS_MAC:
             kwargs["darwin_intercept"] = self._darwin_intercept
+        elif IS_WINDOWS:
+            kwargs["win32_event_filter"] = self._win32_filter
         self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release, **kwargs)
         self._listener.daemon = True
         self._listener.start()
@@ -749,6 +752,45 @@ class HotkeyManager:
         action = self._action_for(key)
         if action is not None:
             self._held.pop(action, None)
+
+    # -- Windows: swallow the Alt+A / Alt+S keystrokes ---------------------
+    # Without this the focused app also receives Alt+A. Apps such as Slack react
+    # by moving focus (e.g. into the message box), which drops the text selection
+    # before the simulated Ctrl+C runs, so nothing gets copied.
+    def _win32_filter(self, msg, data):
+        try:
+            if data.flags & 0x10:  # LLKHF_INJECTED: our own / other synthetic keys
+                return True
+            action = VK_ACTIONS.get(data.vkCode)
+            if action is None:
+                return True
+            if msg in (0x100, 0x104):  # WM_KEYDOWN / WM_SYSKEYDOWN
+                if not data.flags & 0x20:  # LLKHF_ALTDOWN: Alt is not held
+                    return True
+                if action not in self._win_swallowed:
+                    self._win_swallowed.add(action)
+                    # Alt pressed+released with nothing in between would activate the
+                    # app's menu bar; send a dummy key so Windows treats it as a chord.
+                    threading.Thread(target=self._win_mask_alt, daemon=True).start()
+                    self._dispatch(action)
+                self._listener.suppress_event()
+            elif msg in (0x101, 0x105):  # WM_KEYUP / WM_SYSKEYUP
+                if action in self._win_swallowed:
+                    self._win_swallowed.discard(action)
+                    self._listener.suppress_event()
+        except self._listener.SuppressException:
+            raise
+        except Exception:
+            log.debug("win32 filter failed", exc_info=True)
+        return True
+
+    def _win_mask_alt(self) -> None:
+        try:
+            ctl = keyboard.Controller()
+            ctl.press(keyboard.KeyCode.from_vk(0xFF))  # unassigned virtual key
+            ctl.release(keyboard.KeyCode.from_vk(0xFF))
+        except Exception:
+            log.debug("could not mask Alt", exc_info=True)
 
     # -- macOS: swallow the Option+A / Option+S keystrokes -----------------
     def _darwin_intercept(self, event_type, event):
